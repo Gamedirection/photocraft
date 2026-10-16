@@ -35,7 +35,7 @@ pub enum Format {
     Dpx,
     /// Kodak Cineon (`.cin`, the 10-bit film-scan format DPX grew from): read-only.
     Cineon,
-    /// JPEG XL: read-only; see [`ASYMMETRIC_EXCEPTIONS`].
+    /// JPEG XL: read and written behind the `jxl` feature (jxl-oxide and jixel, both pure Rust).
     Jxl,
 }
 
@@ -93,13 +93,6 @@ pub const ASYMMETRIC_EXCEPTIONS: &[(Format, &str)] = &[
          non-default `heif` feature, which official builds enable), so iPhone and Mac photos open; \
          writing needs an HEVC encoder, and the mature ones (x265, libheif) are C, so write stays \
          unsupported. Without the feature HEIF is detected but neither read nor written.",
-    ),
-    (
-        Format::Jxl,
-        "JPEG XL decode uses jxl-oxide (pure Rust, in the optional photocraft-jxl crate behind the \
-         non-default `jxl` feature, which official builds enable); writing needs an encoder and the \
-         only complete one (libjxl) is C++, so write stays unsupported. Without the feature JPEG XL \
-         is detected but neither read nor written.",
     ),
 ];
 
@@ -280,16 +273,18 @@ pub fn caps(format: Format) -> FormatCaps {
         // `text`: the DPX header fields only (see `fidelity_warnings_with`).
         Format::Dpx => FormatCaps { depths: &[S::U8, S::U16], layouts: &[L::Gray, L::Rgb, L::Rgba], text: true, ..base },
         Format::Cineon => FormatCaps { read: true, write: false, depths: &[S::U16], layouts: &[L::Gray, L::Rgb], alpha: false, ..base },
+        // Lossy or lossless by `EncodeOptions::jxl_lossless` (see `fidelity_warnings_with`); F16
+        // is written as F32, which holds it exactly.
         Format::Jxl => FormatCaps {
             read: cfg!(feature = "jxl"),
-            write: false,
-            depths: &[S::U8, S::U16, S::F16, S::F32],
+            write: cfg!(feature = "jxl"),
+            depths: &[S::U8, S::U16, S::F32],
             layouts: RGB_GRAY,
             icc: true,
             exif: true,
             xmp: true,
             animation: true,
-            lossy: true,
+            lossy: false,
             ..base
         },
     }

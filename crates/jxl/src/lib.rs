@@ -11,15 +11,22 @@
 //! upright, with [`Decoded::orientation`] saying what was applied, so a caller that wants them as
 //! coded can turn them back.
 //!
-//! Never panics: every call into jxl-oxide runs under `catch_unwind` and a panic inside it
-//! becomes [`Error::Malformed`].
+//! Every frame of an animation comes from [`decode_frames`], and [`reconstruct_jpeg`] rebuilds the
+//! original JPEG file of a losslessly recompressed one. The encoder ([`encode`],
+//! [`recompress_jpeg`]) wraps `jixel`, a pure-Rust JPEG XL encoder.
+//!
+//! Never panics: every call into jxl-oxide or jixel runs under `catch_unwind` and a panic inside
+//! it becomes [`Error::Malformed`].
 
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 use jxl_oxide::color::{ColourEncoding, ColourSpace, Primaries, TransferFunction, WhitePoint};
 use jxl_oxide::image::BitDepth;
-use jxl_oxide::{AllocTracker, AuxBoxData, InitializeResult, JxlImage, PixelFormat, UninitializedJxlImage};
+use jxl_oxide::{AllocTracker, AuxBoxData, InitializeResult, JpegReconstructionStatus, JxlImage, PixelFormat, UninitializedJxlImage};
+
+mod encode;
+pub use encode::{DEFAULT_EFFORT, Input, InputSample, Settings, encode, recompress_jpeg};
 
 /// Channel layout of the decoded samples (interleaved, alpha last and straight).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -184,6 +191,8 @@ pub struct Decoder<'a> {
     /// Bytes the container parser has consumed; the rest is still to be fed.
     fed: usize,
     info: Info,
+    /// The budget the decoder was opened with; [`Decoder::decode_frames`] holds every frame in it.
+    alloc_limit: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -213,7 +222,7 @@ impl<'a> Decoder<'a> {
             match uninit.try_init().map_err(err)? {
                 InitializeResult::Initialized(image) => {
                     let info = info_of(&image)?;
-                    return Ok(Decoder { bytes, image, fed, info });
+                    return Ok(Decoder { bytes, image, fed, info, alloc_limit });
                 }
                 InitializeResult::NeedMoreData(u) => uninit = u,
             }
@@ -230,8 +239,9 @@ impl<'a> Decoder<'a> {
         guarded(|| self.decode_unguarded())
     }
 
-    fn decode_unguarded(mut self) -> Result<Decoded, Error> {
-        let (bytes, info) = (self.bytes, self.info);
+    /// Feeds the rest of the file to the decoder.
+    fn load(&mut self) -> Result<(), Error> {
+        let bytes = self.bytes;
         let mut at = self.fed;
         while at < bytes.len() {
             let chunk = bytes.get(at..).unwrap_or(&[]);
@@ -241,55 +251,64 @@ impl<'a> Decoder<'a> {
             }
             at = at.saturating_add(consumed);
         }
-        self.image.finalize().map_err(err)?;
-        let image = &self.image;
-        let frames = u32::try_from(image.num_loaded_keyframes()).unwrap_or(u32::MAX);
-        if frames == 0 {
+        self.fed = at;
+        self.image.finalize().map_err(err)
+    }
+
+    fn decode_unguarded(mut self) -> Result<Decoded, Error> {
+        self.load()?;
+        if self.image.num_loaded_keyframes() == 0 {
             return Err(Error::Malformed("the file ends before its first frame is complete".into()));
         }
+        let data = render(&self.image, 0, &self.info)?;
+        Ok(self.decoded(data))
+    }
 
-        let render = image.render_frame(0).map_err(err)?;
-        let mut stream = render.stream();
-        let (width, height) = (stream.width(), stream.height());
-        let channels = usize::try_from(stream.channels()).unwrap_or(usize::MAX);
-        if (width, height) != (info.width, info.height) || channels != info.layout.channels() {
-            return Err(Error::Malformed(format!(
-                "the rendered frame is {width}x{height} with {channels} channels, the header says {}x{} with {}",
-                info.width,
-                info.height,
-                info.layout.channels()
-            )));
+    /// Decodes every keyframe (at most `max_frames`), upright: the first with its metadata, then
+    /// each frame's samples and how long it shows. A still image has one frame.
+    pub fn decode_frames(self, max_frames: usize) -> Result<Animation, Error> {
+        guarded(|| self.decode_frames_unguarded(max_frames))
+    }
+
+    fn decode_frames_unguarded(mut self, max_frames: usize) -> Result<Animation, Error> {
+        self.load()?;
+        let loaded = self.image.num_loaded_keyframes();
+        if loaded == 0 {
+            return Err(Error::Malformed("the file ends before its first frame is complete".into()));
         }
-        let count =
-            (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(channels)).ok_or_else(|| Error::Limit("image size overflows".into()))?;
+        if loaded > max_frames {
+            return Err(Error::Limit(format!("{loaded} frames are more than the {max_frames} allowed")));
+        }
+        // Every frame is held at once: the decoder's budget bounds them all together.
+        let info = self.info;
+        let frame_bytes = u64::from(info.width) * u64::from(info.height) * (info.layout.channels() * info.sample.bytes()) as u64;
+        let total = frame_bytes.saturating_mul(loaded as u64);
+        if total > self.alloc_limit as u64 {
+            return Err(Error::Limit(format!("{loaded} frames need {total} bytes, more than the {} allowed", self.alloc_limit)));
+        }
+        // Ticks per second; a still image (no animation header) shows its one frame for 0 ms.
+        let tps = self.image.image_header().metadata.animation.as_ref().map(|a| (u64::from(a.tps_numerator), u64::from(a.tps_denominator)));
+        let mut frames = Vec::with_capacity(loaded);
+        for k in 0..loaded {
+            let data = render(&self.image, k, &self.info)?;
+            let ticks = self.image.frame_header(k).map_or(0, |h| u64::from(h.duration));
+            let duration_ms = match tps {
+                Some((num, den)) if num > 0 => u32::try_from(ticks.saturating_mul(1000).saturating_mul(den) / num).unwrap_or(u32::MAX),
+                _ => 0,
+            };
+            frames.push(Frame { data, duration_ms });
+        }
+        let first = self.decoded(frames.first().map(|f| f.data.clone()).unwrap_or_default());
+        Ok(Animation { first, frames })
+    }
 
-        // A premultiplied (associated) alpha channel is turned straight on float samples, then
-        // quantized; everything else is handed out as the decoder converts it.
-        let data = match (info.sample, info.premultiplied) {
-            (Sample::U8, false) => {
-                let mut buf = vec![0u8; count];
-                stream.write_to_buffer(&mut buf);
-                buf
-            }
-            (Sample::U16, false) => {
-                let mut buf = vec![0u16; count];
-                stream.write_to_buffer(&mut buf);
-                buf.iter().flat_map(|v| v.to_ne_bytes()).collect()
-            }
-            (sample, premultiplied) => {
-                let mut buf = vec![0f32; count];
-                stream.write_to_buffer(&mut buf);
-                if premultiplied {
-                    unpremultiply(&mut buf, channels);
-                }
-                quantize(&buf, sample)
-            }
-        };
-
+    /// The decoded image of a loaded file whose first frame rendered to `data`.
+    fn decoded(&self, data: Vec<u8>) -> Decoded {
+        let (info, image) = (&self.info, &self.image);
         let (exif, xmp) = metadata(image);
-        Ok(Decoded {
-            width,
-            height,
+        Decoded {
+            width: info.width,
+            height: info.height,
             layout: info.layout,
             sample: info.sample,
             bits_per_sample: info.bits_per_sample,
@@ -299,11 +318,71 @@ impl<'a> Decoder<'a> {
             icc: icc(image),
             exif,
             xmp,
-            frames,
+            frames: u32::try_from(image.num_loaded_keyframes()).unwrap_or(u32::MAX),
             animated: info.animated,
             complete: image.is_loading_done(),
-        })
+        }
     }
+}
+
+/// One frame of [`Animation`]: interleaved samples laid out as [`Animation::first`]'s, and how
+/// long it shows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Frame {
+    pub data: Vec<u8>,
+    /// On-screen time in milliseconds (0 for a still image or a frame with no duration).
+    pub duration_ms: u32,
+}
+
+/// Every frame of a file ([`decode_frames`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Animation {
+    /// The first frame with the file's metadata (what [`decode`] returns).
+    pub first: Decoded,
+    /// Every frame, the first included, in order.
+    pub frames: Vec<Frame>,
+}
+
+/// Renders keyframe `k` as `info` says the samples are laid out: upright, straight alpha.
+fn render(image: &JxlImage, k: usize, info: &Info) -> Result<Vec<u8>, Error> {
+    let render = image.render_frame(k).map_err(err)?;
+    let mut stream = render.stream();
+    let (width, height) = (stream.width(), stream.height());
+    let channels = usize::try_from(stream.channels()).unwrap_or(usize::MAX);
+    if (width, height) != (info.width, info.height) || channels != info.layout.channels() {
+        return Err(Error::Malformed(format!(
+            "the rendered frame is {width}x{height} with {channels} channels, the header says {}x{} with {}",
+            info.width,
+            info.height,
+            info.layout.channels()
+        )));
+    }
+    let count =
+        (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(channels)).ok_or_else(|| Error::Limit("image size overflows".into()))?;
+
+    // A premultiplied (associated) alpha channel is turned straight on float samples, then
+    // quantized; everything else is handed out as the decoder converts it.
+    let data = match (info.sample, info.premultiplied) {
+        (Sample::U8, false) => {
+            let mut buf = vec![0u8; count];
+            stream.write_to_buffer(&mut buf);
+            buf
+        }
+        (Sample::U16, false) => {
+            let mut buf = vec![0u16; count];
+            stream.write_to_buffer(&mut buf);
+            buf.iter().flat_map(|v| v.to_ne_bytes()).collect()
+        }
+        (sample, premultiplied) => {
+            let mut buf = vec![0f32; count];
+            stream.write_to_buffer(&mut buf);
+            if premultiplied {
+                unpremultiply(&mut buf, channels);
+            }
+            quantize(&buf, sample)
+        }
+    };
+    Ok(data)
 }
 
 fn layout_of(format: PixelFormat) -> Result<Layout, Error> {
@@ -359,6 +438,30 @@ pub fn probe(bytes: &[u8], alloc_limit: usize) -> Result<Info, Error> {
 /// Decodes the first frame, upright, with its metadata.
 pub fn decode(bytes: &[u8], options: &Options) -> Result<Decoded, Error> {
     Decoder::open(bytes, options.alloc_limit)?.decode()
+}
+
+/// Decodes every frame (at most `max_frames`, else [`Error::Limit`]), upright.
+pub fn decode_frames(bytes: &[u8], options: &Options, max_frames: usize) -> Result<Animation, Error> {
+    Decoder::open(bytes, options.alloc_limit)?.decode_frames(max_frames)
+}
+
+/// The original JPEG file of a JPEG XL file made by recompressing one losslessly
+/// ([`recompress_jpeg`], or libjxl's `cjxl` on a `.jpg`), rebuilt byte for byte. `Ok(None)` when
+/// the file holds no JPEG reconstruction data (it was not made from a JPEG).
+pub fn reconstruct_jpeg(bytes: &[u8], options: &Options) -> Result<Option<Vec<u8>>, Error> {
+    guarded(|| {
+        let mut d = Decoder::open(bytes, options.alloc_limit)?;
+        d.load()?;
+        match d.image.jpeg_reconstruction_status() {
+            JpegReconstructionStatus::Available => {}
+            JpegReconstructionStatus::Unavailable => return Ok(None),
+            JpegReconstructionStatus::Invalid => return Err(Error::Malformed("the JPEG reconstruction data is invalid".into())),
+            JpegReconstructionStatus::NeedMoreData => return Err(Error::Malformed("the file ends inside its JPEG reconstruction data".into())),
+        }
+        let mut out = Vec::new();
+        d.image.reconstruct_jpeg(&mut out).map_err(err)?;
+        Ok(Some(out))
+    })
 }
 
 /// Straight alpha from associated alpha: colour divided by alpha where there is any.

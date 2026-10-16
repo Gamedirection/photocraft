@@ -94,8 +94,8 @@ fn jxl_is_detected_always_and_readable_only_with_the_feature() {
     }
     assert_eq!(from_extension("IMG_0001.JXL"), Some(Format::Jxl));
     assert_eq!(caps(Format::Jxl).read, cfg!(feature = "jxl"));
-    assert!(!caps(Format::Jxl).write);
-    assert!(ASYMMETRIC_EXCEPTIONS.iter().any(|(f, _)| *f == Format::Jxl));
+    assert_eq!(caps(Format::Jxl).write, cfg!(feature = "jxl"));
+    assert!(!ASYMMETRIC_EXCEPTIONS.iter().any(|(f, _)| *f == Format::Jxl));
     assert_eq!(detect(b"\0\0\0\x0cJXL \r\n\x87\x0b"), None, "a wrong signature box is not JPEG XL");
 }
 

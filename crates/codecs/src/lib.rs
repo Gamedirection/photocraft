@@ -154,6 +154,26 @@ pub fn decode_gif_frames(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<Anima
     crate::codecs::gif_frames::decode(bytes, opts)
 }
 
+/// Decodes every frame of a JPEG XL file (a still one yields one), each a full, upright picture
+/// with its duration. [`decode`] keeps the first frame only. At most [`MAX_GIF_FRAMES`] frames,
+/// and all of them within `opts.limits`.
+pub fn decode_jxl_frames(bytes: &[u8], opts: &DecodeOptions) -> Result<Vec<AnimationFrame>, CodecError> {
+    jxl::decode_frames(bytes, opts)
+}
+
+/// Recompresses a JPEG file as JPEG XL losslessly: about 20% smaller, the pixels exactly the
+/// JPEG's, and the original file can be rebuilt byte for byte ([`jxl_to_jpeg`]). A JPEG whose
+/// coefficients would not fit in `limits.max_alloc` is refused before anything is allocated.
+pub fn jpeg_to_jxl(jpeg: &[u8], limits: &Limits) -> Result<Vec<u8>, CodecError> {
+    jxl::recompress_jpeg(jpeg, limits)
+}
+
+/// The original JPEG file of a JPEG XL file recompressed from one ([`jpeg_to_jxl`], or libjxl's
+/// `cjxl` on a `.jpg`), rebuilt byte for byte. `Ok(None)` when the file was not made from a JPEG.
+pub fn jxl_to_jpeg(bytes: &[u8], limits: &Limits) -> Result<Option<Vec<u8>>, CodecError> {
+    jxl::reconstruct_jpeg(bytes, limits)
+}
+
 /// The Orientation (1–8) of the page [`decode`] opens from a TIFF or BigTIFF file; 1 when it is
 /// absent, malformed or out of range.
 pub fn tiff_orientation(bytes: &[u8]) -> u16 {
@@ -259,7 +279,8 @@ pub fn encode(image: &Image, format: Format, opts: &EncodeOptions) -> Result<Vec
         Format::Dpx => dpx::encode(image, plan, opts),
         Format::Cineon => Err(CodecError::unsupported(format, "Cineon is import-only; save as DPX, TIFF or EXR instead")),
         Format::OpenExr => exr::encode(image, plan, opts),
-        Format::Heif | Format::Jxl => Err(CodecError::unsupported(format, "encoding is not available in this build")),
+        Format::Heif => Err(CodecError::unsupported(format, "encoding is not available in this build")),
+        Format::Jxl => jxl::encode(image, plan, opts),
         Format::Gif | Format::Bmp | Format::Tga | Format::Ico | Format::Qoi | Format::Hdr | Format::Avif => via_image::encode(format, image, plan, opts),
     }
 }

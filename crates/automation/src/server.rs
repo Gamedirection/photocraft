@@ -1035,6 +1035,8 @@ impl PhotocraftMcp {
                     opts.encode.jpeg_quality = q.clamp(1, 100);
                     opts.encode.webp_quality = q.clamp(1, 100);
                     opts.encode.webp_lossless = false;
+                    opts.encode.jxl_quality = q.clamp(1, 100);
+                    opts.encode.jxl_lossless = false;
                 }
                 let path = p.path.map(PathBuf::from);
                 h.save(p.index, path.as_deref(), p.format.as_deref(), &opts)

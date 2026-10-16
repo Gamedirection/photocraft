@@ -60,9 +60,13 @@ fn an_animation_opens_with_a_warning() {
 }
 
 #[test]
-fn jxl_cannot_be_written_and_says_so() {
+fn jxl_is_written_and_opens_again_unchanged() {
     let d = import("x.jxl", RGB8).unwrap().document;
-    assert!(export(&d, "x.jxl", &ExportOptions::default()).is_err());
+    let out = export(&d, "x.jxl", &ExportOptions::default()).unwrap();
+    assert_eq!(detect(&out.bytes), Some(Format::Jxl));
+    let again = import("y.jxl", &out.bytes).unwrap().document;
+    assert_eq!((again.size.width, again.size.height), (d.size.width, d.size.height));
+    assert!(decode(&out.bytes).unwrap().data() == decode(RGB8).unwrap().data(), "the default export is lossless");
 }
 
 #[test]
@@ -70,4 +74,17 @@ fn broken_jxl_is_an_error_not_a_crash() {
     for bytes in [&b""[..], &RGB8[..RGB8.len() / 2], &[0xFF, 0x0A, 0xFF, 0xFF, 0xFF, 0xFF][..]] {
         assert!(import("x.jxl", bytes).is_err());
     }
+}
+
+#[test]
+fn every_frame_of_an_animation_imports_as_a_document() {
+    let mut delays = vec![];
+    let n = photocraft_io::import_jxl_frames("a.jxl", ANIMATED, &mut |doc, delay_ms| {
+        assert_eq!((doc.size.width, doc.size.height), (12, 9));
+        delays.push(delay_ms);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!((n, delays), (3, vec![100, 100, 100]));
+    assert!(photocraft_io::import_jxl_frames("b.jxl", b"", &mut |_, _| Ok(())).is_err());
 }

@@ -1,4 +1,5 @@
-//! JPEG XL decoding against libjxl's encoder (feature `jxl`). The fixtures in `fixtures/jxl/` are
+//! JPEG XL decoding against libjxl's encoder, and our encoder against both decoders (feature
+//! `jxl`). The fixtures in `fixtures/jxl/` are
 //! written by `scripts/jxl_fixtures.py` with `cjxl` from procedural images that `pattern`,
 //! `alpha`, `smooth` and `float_sample` regenerate here, so lossless files are checked sample for
 //! sample against an independent encoder and lossy ones by PSNR. `exif-xmp-orient6.src.jpg` is
@@ -62,19 +63,21 @@ fn smooth_image() -> Image {
 }
 
 #[test]
-fn jxl_is_read_only_and_listed() {
+fn jxl_is_read_and_written_and_listed() {
     let c = caps(Format::Jxl);
-    assert!(c.read && !c.write);
+    assert!(c.read && c.write);
     assert!(c.icc && c.exif && c.xmp && c.animation);
-    assert_eq!(c.depths, &[SampleType::U8, SampleType::U16, SampleType::F16, SampleType::F32]);
-    assert!(ASYMMETRIC_EXCEPTIONS.iter().any(|(f, _)| *f == Format::Jxl));
+    assert_eq!(c.depths, &[SampleType::U8, SampleType::U16, SampleType::F32]);
+    assert!(!ASYMMETRIC_EXCEPTIONS.iter().any(|(f, _)| *f == Format::Jxl));
     for ext in ["jxl", "JXL", "photo.jxl", "dir/IMG_0001.JXL"] {
         assert_eq!(from_extension(ext), Some(Format::Jxl), "{ext}");
     }
     assert_eq!(Format::Jxl.mime_type(), "image/jxl");
+    // Lossless by default: nothing to warn about for an 8-bit RGB image.
     let img = decode(RGB8).unwrap();
-    assert!(matches!(encode(&img, Format::Jxl, &EncodeOptions::default()), Err(CodecError::Unsupported { .. })));
-    assert_eq!(fidelity_warnings(&img, Format::Jxl), vec![FidelityWarning::WriteUnsupported { format: Format::Jxl }]);
+    assert_eq!(fidelity_warnings(&img, Format::Jxl), vec![]);
+    let lossy = EncodeOptions { jxl_lossless: false, ..Default::default() };
+    assert_eq!(fidelity_warnings_with(&img, Format::Jxl, &lossy), vec![FidelityWarning::LossyCompression]);
 }
 
 #[test]
@@ -284,4 +287,143 @@ fn every_truncation_errors_or_decodes_never_panics() {
             }
         }
     }
+}
+
+// ---------- writing ----------
+
+/// A procedural image of every layout and depth the encoder takes, with values above 1 for float.
+fn procedural(layout: ChannelLayout, sample: SampleType) -> Image {
+    let ch = layout.channels() as u32;
+    let v: Vec<f32> = (0..H)
+        .flat_map(|y| {
+            (0..W).flat_map(move |x| (0..ch).map(move |c| if sample.is_float() { float_sample(x, y, c) } else { pattern(x, y, c, 255) as f32 / 255.0 }))
+        })
+        .collect();
+    Image::from_normalized(W, H, layout, sample, &v).unwrap()
+}
+
+/// Lossless export decodes to the same samples, through our decoder, for every depth and layout
+/// (16-bit float is written as 32-bit float, which holds it exactly).
+#[test]
+fn lossless_export_round_trips_every_depth_and_layout() {
+    for sample in [SampleType::U8, SampleType::U16, SampleType::F16, SampleType::F32] {
+        for layout in [ChannelLayout::Gray, ChannelLayout::GrayA, ChannelLayout::Rgb, ChannelLayout::Rgba] {
+            let img = procedural(layout, sample);
+            let bytes = encode(&img, Format::Jxl, &EncodeOptions::default()).unwrap_or_else(|e| panic!("{sample:?} {layout:?}: {e}"));
+            let back = decode(&bytes).unwrap();
+            assert_eq!(back.dimensions(), (W, H));
+            let want = if sample == SampleType::F16 { SampleType::F32 } else { sample };
+            assert_eq!(back.sample_type(), want, "{sample:?} {layout:?}");
+            // Float gray comes back as RGB(A) with the gray in every colour channel.
+            let expected =
+                if sample.is_float() && layout.is_gray() { img.converted(back.layout(), want).into_owned() } else { img.converted(layout, want).into_owned() };
+            assert!(back.data() == expected.data(), "{sample:?} {layout:?}: samples differ");
+        }
+    }
+}
+
+/// Lossy export is close and smaller than lossless; the warning says so.
+#[test]
+fn lossy_export_is_close_and_smaller() {
+    let img = smooth_image();
+    let lossless = encode(&img, Format::Jxl, &EncodeOptions::default()).unwrap();
+    let lossy = encode(&img, Format::Jxl, &EncodeOptions { jxl_lossless: false, jxl_quality: 75, ..Default::default() }).unwrap();
+    assert!(lossy.len() < lossless.len(), "{} vs {}", lossy.len(), lossless.len());
+    // A 12x9 picture is small for a lossy coder: the closeness is checked at high quality.
+    let high = decode(&encode(&img, Format::Jxl, &EncodeOptions { jxl_lossless: false, jxl_quality: 95, ..Default::default() }).unwrap()).unwrap();
+    assert!(psnr(&high, &img) > 30.0, "{}", psnr(&high, &img));
+    // Every effort and the progressive option make files that open.
+    for effort in [1, 5, 9] {
+        for jxl_progressive in [false, true] {
+            let o = EncodeOptions { jxl_lossless: false, jxl_effort: effort, jxl_progressive, ..Default::default() };
+            assert_eq!(decode(&encode(&img, Format::Jxl, &o).unwrap()).unwrap().dimensions(), (W, H));
+        }
+    }
+}
+
+/// The ICC profile, EXIF and XMP are written (the EXIF upright), and left out when asked.
+#[test]
+fn export_keeps_the_profile_and_metadata() {
+    let p3 = decode(P3).unwrap();
+    assert!(p3.icc.is_some(), "the P3 fixture has a profile");
+    let back = decode(&encode(&p3, Format::Jxl, &EncodeOptions::default()).unwrap()).unwrap();
+    assert!(back.icc.is_some(), "the profile is kept");
+    assert!(back.data() == p3.data(), "lossless, in the same colour space");
+    assert_eq!(fidelity_warnings(&p3, Format::Jxl), vec![], "nothing dropped");
+    let without = encode(&p3, Format::Jxl, &EncodeOptions { embed_icc: false, ..Default::default() }).unwrap();
+    assert!(decode(&without).unwrap().icc.is_none());
+
+    let meta = decode(EXIF_XMP_ORIENT6).unwrap();
+    assert!(meta.meta.exif.is_some() && meta.meta.xmp.is_some());
+    let back = decode(&encode(&meta, Format::Jxl, &EncodeOptions::default()).unwrap()).unwrap();
+    assert_eq!(back.dimensions(), meta.dimensions(), "upright, as written");
+    assert_eq!(back.meta.exif.as_deref().map(exif_orientation), Some(1));
+    assert!(back.meta.xmp.is_some());
+    let bare = encode(&meta, Format::Jxl, &EncodeOptions { embed_metadata: false, ..Default::default() }).unwrap();
+    let bare = decode(&bare).unwrap();
+    assert!(bare.meta.exif.is_none() && bare.meta.xmp.is_none());
+}
+
+/// Float gray with a (gray) profile: written as RGB, so it stays exact, and the profile is
+/// reported dropped.
+#[test]
+fn float_gray_with_a_profile_is_written_as_rgb() {
+    let mut img = procedural(ChannelLayout::Gray, SampleType::F32);
+    img.icc = decode(GRAY8).unwrap().icc.or_else(|| Some(vec![0; 132]));
+    let w = fidelity_warnings(&img, Format::Jxl);
+    assert!(w.contains(&FidelityWarning::IccDropped), "{w:?}");
+    let back = decode(&encode(&img, Format::Jxl, &EncodeOptions::default()).unwrap()).unwrap();
+    assert_eq!(back.layout(), ChannelLayout::Rgb);
+}
+
+// ---------- every frame ----------
+
+#[test]
+fn every_frame_of_an_animation_decodes() {
+    let frames = decode_jxl_frames(ANIMATED, &DecodeOptions::default()).unwrap();
+    assert_eq!(frames.len(), 3);
+    assert!(frames.iter().all(|f| f.image.dimensions() == (W, H) && f.delay_ms == 100), "{:?}", frames.iter().map(|f| f.delay_ms).collect::<Vec<_>>());
+    assert!(frames[0].image.data() != frames[1].image.data(), "the frames differ");
+    assert_eq!(frames[0].image.data(), decode(ANIMATED).unwrap().data(), "the first frame is what decode opens");
+    // A still image is one frame of 0 ms.
+    let still = decode_jxl_frames(RGB8, &DecodeOptions::default()).unwrap();
+    assert_eq!((still.len(), still[0].delay_ms), (1, 0));
+    // Limits hold for the frames together, and broken files are errors.
+    let tiny = DecodeOptions { limits: Limits { max_alloc: 12 * 9 * 4 * 2, ..Default::default() }, ..Default::default() };
+    assert!(decode_jxl_frames(ANIMATED, &tiny).is_err(), "three frames do not fit in two frames' budget");
+    // A file cut inside the animation gives the frames before the cut, marked truncated, or an
+    // error when not even the first frame is whole; never a panic.
+    for n in 0..ANIMATED.len() {
+        if let Ok(f) = decode_jxl_frames(&ANIMATED[..n], &DecodeOptions::default()) {
+            assert!(!f.is_empty() && f.len() <= 3);
+            assert!(f[0].image.warnings.contains(&DecodeWarning::Truncated { format: Format::Jxl }), "{n}");
+        }
+    }
+    assert!(decode_jxl_frames(b"", &DecodeOptions::default()).is_err());
+}
+
+// ---------- lossless JPEG recompression ----------
+
+/// libjxl's recompressed JPEG gives back its source file byte for byte.
+#[test]
+fn a_recompressed_jpeg_rebuilds_its_source_exactly() {
+    assert_eq!(jxl_to_jpeg(JPEG_RECON, &Limits::default()).unwrap().as_deref(), Some(SOURCE_JPEG));
+    assert_eq!(jxl_to_jpeg(RGB8, &Limits::default()).unwrap(), None, "a file not made from a JPEG");
+    assert!(jxl_to_jpeg(&JPEG_RECON[..JPEG_RECON.len() / 2], &Limits::default()).is_err());
+}
+
+/// Our recompression: smaller than the JPEG, the same pixels, and the JPEG comes back byte for
+/// byte through both decoders (ours and the one libjxl's file was checked with).
+#[test]
+fn recompressing_a_jpeg_is_lossless_and_reversible() {
+    let jxl = jpeg_to_jxl(SOURCE_JPEG, &Limits::default()).unwrap();
+    assert_eq!(detect(&jxl), Some(Format::Jxl));
+    assert_eq!(jxl_to_jpeg(&jxl, &Limits::default()).unwrap().as_deref(), Some(SOURCE_JPEG));
+    let (a, b) = (decode_with(&jxl, &keep()).unwrap(), source_jpeg());
+    assert_eq!(a.dimensions(), b.dimensions());
+    assert!(psnr(&a, &b) > 40.0, "the JPEG's pixels: {}", psnr(&a, &b));
+    assert!(jpeg_to_jxl(b"not a jpeg", &Limits::default()).is_err());
+    assert!(jpeg_to_jxl(&SOURCE_JPEG[..SOURCE_JPEG.len() / 3], &Limits::default()).is_err());
+    let tiny = Limits { max_alloc: 100, ..Default::default() };
+    assert!(matches!(jpeg_to_jxl(SOURCE_JPEG, &tiny), Err(CodecError::LimitExceeded(_))));
 }
